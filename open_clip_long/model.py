@@ -257,12 +257,47 @@ class CLIP(nn.Module):
         self.text_projection = text.text_projection
         self.text_pool_type = text.pool_type
         self.register_buffer('attn_mask', text.attn_mask, persistent=False)
+        
+        # Add positional embedding stretching part
+        self.apply_positional_embedding_stretching()
 
         self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
         if init_logit_bias is not None:
             self.logit_bias = nn.Parameter(torch.ones([]) * init_logit_bias)
         else:
             self.logit_bias = None
+
+    def apply_positional_embedding_stretching(self):
+        """
+        A function to stretch the positional embedding to 4x length with knowledge preservation.
+        """
+        with torch.no_grad():
+            positional_embedding_pre = self.positional_embedding
+            length, dim = positional_embedding_pre.shape
+            keep_len = 20  # preserve first 20 positional embeddings
+
+            # Set new positional embedding and initialize with zeros
+            positional_embedding_new = torch.zeros([4 * length - 3 * keep_len, dim], dtype=positional_embedding_pre.dtype)
+
+            for i in range(keep_len):
+                positional_embedding_new[i] = positional_embedding_pre[i]
+
+            # Embedding stretching with knowledge preservation
+            for i in range(length - 1 - keep_len):
+                base_idx = 4 * i + keep_len
+                positional_embedding_new[base_idx] = positional_embedding_pre[i + keep_len]
+                positional_embedding_new[base_idx + 1] = 3 * positional_embedding_pre[i + keep_len] / 4 + 1 * positional_embedding_pre[i + 1 + keep_len] / 4
+                positional_embedding_new[base_idx + 2] = 2 * positional_embedding_pre[i + keep_len] / 4 + 2 * positional_embedding_pre[i + 1 + keep_len] / 4
+                positional_embedding_new[base_idx + 3] = 1 * positional_embedding_pre[i + keep_len] / 4 + 3 * positional_embedding_pre[i + 1 + keep_len] / 4
+
+            # Additional stretching for the last positional embedding
+            end_idx = 4 * length - 3 * keep_len - 4
+            for i in range(4):
+                positional_embedding_new[end_idx + i] = positional_embedding_pre[length - 1] + i * (positional_embedding_pre[length - 1] - positional_embedding_pre[length - 2]) / 4
+
+            # Apply new positional embedding
+            self.positional_embedding = nn.Parameter(positional_embedding_new, requires_grad=False)
+
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
@@ -299,9 +334,9 @@ class CLIP(nn.Module):
     def encode_text(self, text, normalize: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()
 
-        x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
+        x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model] [2, 248, 768]
 
-        x = x + self.positional_embedding.to(cast_dtype)
+        x = x + self.positional_embedding.to(cast_dtype) # 2nd dimension of positional embedding is 77, which is same to previous CLIP
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x, attn_mask=self.attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
